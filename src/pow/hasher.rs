@@ -2,10 +2,9 @@
 use crate::Hash;
 use blake2b_simd::State as Blake2bState;
 use lazy_static::lazy_static;
-use log::info;
 use std::ops::BitXor;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use tiny_keccak::Hasher as OtherHasher;
 
 const BLOCK_HASH_DOMAIN: &[u8] = b"BlockHash";
@@ -25,17 +24,20 @@ const NUM_DATASET_ACCESSES: u32 = 32;
 const LIGHT_CACHE_ROUNDS: i32 = 3;
 const LIGHT_CACHE_NUM_ITEMS: u32 = 1179641;
 const FULL_DATASET_NUM_ITEMS: u32 = 37748717;
+
+#[rustfmt::skip]
 const SEED: Hash256 = Hash256([
-    0xeb, 0x01, 0x63, 0xae, 0xf2, 0xab, 0x1c, 0x5a, 0x66, 0x31, 0x0c, 0x1c, 0x14, 0xd6, 0x0f, 0x42, 0x55, 0xa9, 0xb3,
-    0x9b, 0x0e, 0xdf, 0x26, 0x53, 0x98, 0x44, 0xf1, 0x17, 0xad, 0x67, 0x21, 0x19,
+    0xeb, 0x01, 0x63, 0xae, 0xf2, 0xab, 0x1c, 0x5a, 
+    0x66, 0x31, 0x0c, 0x1c, 0x14, 0xd6, 0x0f, 0x42, 
+    0x55, 0xa9, 0xb3, 0x9b, 0x0e, 0xdf, 0x26, 0x53, 
+    0x98, 0x44, 0xf1, 0x17, 0xad, 0x67, 0x21, 0x19,
 ]);
 
 const SIZE_U32: usize = std::mem::size_of::<u32>();
 const SIZE_U64: usize = std::mem::size_of::<u64>();
 
-// always build dag
 pub static FISHHASH_FULL_DATASET: AtomicBool = AtomicBool::new(true);
-static FULL_DATASET: OnceLock<Box<[Hash1024]>> = OnceLock::new();
+static FULL_DATASET: OnceLock<Box<[OnceLock<Hash1024>]>> = OnceLock::new();
 
 lazy_static! {
     static ref LIGHT_CACHE: Box<[Hash512]> = {
@@ -181,57 +183,46 @@ impl HashData for Hash256 {
 }
 
 #[inline(always)]
-fn get_dataset_item(index: usize) -> Hash1024 {
-    if FISHHASH_FULL_DATASET.load(Ordering::Relaxed) {
-        let dataset = FULL_DATASET.get_or_init(|| {
-            let mut full_dataset = vec![Hash1024::new(); FULL_DATASET_NUM_ITEMS as usize].into_boxed_slice();
-            prebuild_dataset(&mut full_dataset, &LIGHT_CACHE, num_cpus::get_physical());
-            full_dataset
-        });
-        dataset[index]
-    } else {
-        PowFishHash::calculate_dataset_item_1024(&LIGHT_CACHE, index)
+fn lookup(index: usize) -> Hash1024 {
+    match FISHHASH_FULL_DATASET.load(Ordering::Relaxed) {
+        true => {
+            let dataset =
+                FULL_DATASET.get_or_init(|| (0..FULL_DATASET_NUM_ITEMS as usize).map(|_| OnceLock::new()).collect());
+            *dataset[index].get_or_init(|| PowFishHash::calculate_dataset_item_1024(&LIGHT_CACHE, index))
+        }
+        false => PowFishHash::calculate_dataset_item_1024(&LIGHT_CACHE, index),
     }
 }
 
+/*
 #[inline(always)]
-pub fn prebuild_dataset(full_dataset: &mut Box<[Hash1024]>, light_cache: &[Hash512], num_threads: usize) {
-    info!("prebuilding dataset using {} threads", num_threads);
-    let start = std::time::Instant::now();
+fn lookup(index: usize) -> Hash1024 {
+    if FISHHASH_FULL_DATASET.load(Ordering::Relaxed) {
+        let dataset = FULL_DATASET.get_or_init(|| {
+            println!("init {} items", FULL_DATASET_NUM_ITEMS);
+            (0..FULL_DATASET_NUM_ITEMS as usize)
+                .map(|_| OnceLock::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
 
-    let total_items = full_dataset.len();
-    let progress = Arc::new(AtomicUsize::new(0));
+        let was_cached = dataset[index].get().is_some();
+        let result = *dataset[index].get_or_init(|| {
+            println!("compute {}", index);
+            PowFishHash::calculate_dataset_item_1024(&LIGHT_CACHE, index)
+        });
 
-    std::thread::scope(|scope| {
-        let mut threads = Vec::with_capacity(num_threads);
-        let batch_size = full_dataset.len() / num_threads;
-        let chunks = full_dataset.chunks_mut(batch_size);
-
-        for (index, chunk) in chunks.enumerate() {
-            let chunk_start = index * batch_size;
-            let progress = Arc::clone(&progress);
-
-            let thread_handle = scope.spawn(move || {
-                for (i, item) in chunk.iter_mut().enumerate() {
-                    *item = PowFishHash::calculate_dataset_item_1024(light_cache, chunk_start + i);
-                    let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 4_000_000 == 0 {
-                        let percent = done * 100 / total_items;
-                        info!("prebuilding full dataset: {}% ({}/{})", percent, done, total_items);
-                    }
-                }
-            });
-
-            threads.push(thread_handle);
+        if was_cached {
+            println!("hit {}", index);
         }
 
-        for handle in threads {
-            handle.join().unwrap();
-        }
-    });
-
-    info!("prebuilding full dataset done in {:.1}s", start.elapsed().as_secs_f64());
+        result
+    } else {
+        println!("direct {}", index);
+        PowFishHash::calculate_dataset_item_1024(&LIGHT_CACHE, index)
+    }
 }
+*/
 
 impl PowFishHash {
     #[inline(always)]
@@ -253,9 +244,9 @@ impl PowFishHash {
             let p1 = (mix_group[1] ^ mix_group[4] ^ mix_group[7]) % FULL_DATASET_NUM_ITEMS;
             let p2 = (mix_group[2] ^ mix_group[5] ^ i) % FULL_DATASET_NUM_ITEMS;
 
-            let fetch0 = get_dataset_item(p0 as usize);
-            let mut fetch1 = get_dataset_item(p1 as usize);
-            let mut fetch2 = get_dataset_item(p2 as usize);
+            let fetch0 = lookup(p0 as usize);
+            let mut fetch1 = lookup(p1 as usize);
+            let mut fetch2 = lookup(p2 as usize);
 
             // Modify fetch1 and fetch2
             for j in 0..32 {
@@ -424,7 +415,8 @@ impl Hasher for HeaderHasher {
 
 #[cfg(test)]
 mod tests {
-    use crate::pow::hasher::{PowB3Hash, PowFishHash, FISHHASH_FULL_DATASET};
+    use crate::pow::hasher::FISHHASH_FULL_DATASET;
+    use crate::pow::hasher::{PowB3Hash, PowFishHash};
     use crate::Hash;
     use std::sync::atomic::Ordering;
 
@@ -440,6 +432,33 @@ mod tests {
         let expected_hash1 = "f0afbcd9401f24cf8374418e391e1458a6df7645441dd5dc9cfe8dc9e761e67d";
         assert_eq!(format!("{:x}", hash1), expected_hash1, "PowB3Hash output changed!");
     }
+
+    /*
+    #[test]
+    fn test_lazy_lookup() {
+        FISHHASH_FULL_DATASET.store(true, Ordering::Relaxed);
+
+        let timestamp: u64 = 5435345234;
+        let nonce: u64 = 432432432;
+        let pre_pow_hash = Hash::from_le_bytes([42; 32]);
+
+        println!("Running same hash twice to test caching...");
+
+        // should compute
+        println!("\nFirst run:");
+        let hasher1 = PowB3Hash::new(pre_pow_hash, timestamp);
+        let hash1 = hasher1.finalize_with_nonce(nonce);
+        let _result1 = PowFishHash::fishhashplus_kernel(&hash1);
+
+        // should hit cache
+        println!("\nSecond run (same inputs):");
+        let hasher2 = PowB3Hash::new(pre_pow_hash, timestamp);
+        let hash2 = hasher2.finalize_with_nonce(nonce);
+        let _result2 = PowFishHash::fishhashplus_kernel(&hash2);
+
+        println!("\nExpected: Second run should show cache hits");
+    }
+    */
 
     #[test]
     #[ignore] // this is expensive to run
