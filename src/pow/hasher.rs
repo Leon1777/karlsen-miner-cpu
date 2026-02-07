@@ -236,7 +236,7 @@ fn build_dataset_segment(
         *item = calculate_dataset_item_1024(light_cache, start + index);
 
         let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-        if done % 4_000_000 == 0 {
+        if done.is_multiple_of(4_000_000) {
             let percent = done * 100 / total_items;
             info!("prebuilding full dataset: {}% ({}/{})", percent, done, total_items);
         }
